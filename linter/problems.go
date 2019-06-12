@@ -26,6 +26,7 @@ func init() {
 		"no-pk":       noPKDetector,
 		"bad-charset": badCharsetDetector,
 		"bad-engine":  badEngineDetector,
+		"dupe-index":  dupeIndexDetector,
 	}
 }
 
@@ -129,6 +130,46 @@ func badEngineDetector(schema *tengo.Schema, logicalSchema *fs.LogicalSchema, op
 		}
 	}
 
+	return results
+}
+
+func dupeIndexDetector(schema *tengo.Schema, logicalSchema *fs.LogicalSchema, opts Options) []*Annotation {
+	makeAnnotation := func(tableName, dupeIndexName, betterIndexName string, equivalent bool) *Annotation {
+		key := tengo.ObjectKey{Type: tengo.ObjectTypeTable, Name: tableName}
+		stmt := logicalSchema.Creates[key]
+		re := regexp.MustCompile(fmt.Sprintf("(?i)(key|index)\\s+`?%s(?:`|\\s)", dupeIndexName))
+		var reason string
+		if equivalent {
+			reason = fmt.Sprintf("Indexes %s and %s of table %s are functionally identical.\nOne of them should be dropped.", dupeIndexName, betterIndexName, tableName)
+		} else {
+			reason = fmt.Sprintf("Index %s of table %s is redundant to larger index %s.\nConsider dropping index %s.", dupeIndexName, tableName, betterIndexName, dupeIndexName)
+		}
+		message := fmt.Sprintf("%s Redundant indexes waste disk space, and harm write performance.", reason)
+		return &Annotation{
+			Statement:  stmt,
+			LineOffset: findFirstLineOffset(re, stmt.Text),
+			Summary:    "Redundant index detected",
+			Message:    message,
+		}
+	}
+	results := make([]*Annotation, 0)
+	for _, table := range schema.Tables {
+		for i, idx := range table.SecondaryIndexes {
+			if idx.RedundantTo(table.PrimaryKey) {
+				results = append(results, makeAnnotation(table.Name, idx.Name, "PRIMARY", false))
+				continue
+			}
+			for j, other := range table.SecondaryIndexes {
+				if i != j && idx.RedundantTo(other) {
+					equivalent := idx.Equivalent(other)
+					if !equivalent || i < j { // avoid 2 annotations for an equivalent pair
+						results = append(results, makeAnnotation(table.Name, idx.Name, other.Name, equivalent))
+					}
+					break // max one annotation for each idx
+				}
+			}
+		}
+	}
 	return results
 }
 
